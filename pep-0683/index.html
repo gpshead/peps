@@ -1,0 +1,441 @@
+
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>PEP 683 – Immortal Objects, Using a Fixed Refcount | peps.python.org</title>
+    <link rel="shortcut icon" href="../_static/py.png"/>
+    <link rel="stylesheet" href="../_static/style.css" type="text/css" />
+    <link rel="stylesheet" href="../_static/mq.css" type="text/css" />
+    <link rel="stylesheet" href="../_static/dark.css" type="text/css" media="(prefers-color-scheme: dark)" id="css-dark"/>
+    <link rel="stylesheet" href="../_static/pygments.css" type="text/css" media="(prefers-color-scheme: light)" id="pyg" />
+    <link rel="stylesheet" href="../_static/pygments_dark.css" type="text/css" media="(prefers-color-scheme: dark)" id="pyg-dark" />
+    <link href="https://fonts.googleapis.com/css2?family=Source+Sans+Pro:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+    <meta name="description" content="Python Enhancement Proposals (PEPs)"/>
+</head>
+<body>
+    <section id="pep-page-section">
+        <header>
+            <h1>Python Enhancement Proposals</h1>
+            <ul class="breadcrumbs">
+                <li><a href="https://www.python.org/" title="The Python Programming Language">Python</a> &raquo; </li>
+                <li><a href="../pep-0000/">PEP Index</a> &raquo; </li>
+                <li>PEP 683 – Immortal Objects, Using a Fixed Refcount</li>
+            </ul>
+            <button onClick="toggleColourScheme()"></button>
+        </header>
+        <article>
+            <section id="pep-content">
+<h1 class="page-title">PEP 683 – Immortal Objects, Using a Fixed Refcount</h1>
+<dl class="rfc2822 field-list simple">
+<dt class="field-odd">PEP</dt>
+<dd class="field-odd">683</dd>
+<dt class="field-even">Title</dt>
+<dd class="field-even">Immortal Objects, Using a Fixed Refcount</dd>
+<dt class="field-odd">Author</dt>
+<dd class="field-odd">Eric Snow &lt;ericsnowcurrently&#32;&#97;t&#32;gmail.com&gt;, Eddie Elizondo &lt;eduardo.elizondorueda&#32;&#97;t&#32;gmail.com&gt;</dd>
+<dt class="field-even">Discussions-To</dt>
+<dd class="field-even"><a class="reference external" href="https://mail.python.org/archives/list/python-dev&#64;python.org/thread/TPLEYDCXFQ4AMTW6F6OQFINSIFYBRFCR/">https://mail.python.org/archives/list/python-dev&#64;python.org/thread/TPLEYDCXFQ4AMTW6F6OQFINSIFYBRFCR/</a></dd>
+<dt class="field-odd">Status</dt>
+<dd class="field-odd">Draft</dd>
+<dt class="field-even">Type</dt>
+<dd class="field-even">Standards Track</dd>
+<dt class="field-odd">Created</dt>
+<dd class="field-odd">10-Feb-2022</dd>
+<dt class="field-even">Python-Version</dt>
+<dd class="field-even">3.11</dd>
+<dt class="field-odd">Post-History</dt>
+<dd class="field-odd">15-Feb-2022</dd>
+<dt class="field-even">Resolution</dt>
+<dd class="field-even"><p></p></dd>
+</dl>
+<hr class="docutils" />
+<section id="contents">
+<h2>Contents</h2>
+<ul class="simple">
+<li><a class="reference internal" href="#abstract">Abstract</a></li>
+<li><a class="reference internal" href="#motivation">Motivation</a><ul>
+<li><a class="reference internal" href="#reducing-cache-invalidation">Reducing Cache Invalidation</a></li>
+<li><a class="reference internal" href="#avoiding-data-races">Avoiding Data Races</a></li>
+<li><a class="reference internal" href="#avoiding-copy-on-write">Avoiding Copy-on-Write</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#rationale">Rationale</a></li>
+<li><a class="reference internal" href="#impact">Impact</a><ul>
+<li><a class="reference internal" href="#benefits">Benefits</a></li>
+<li><a class="reference internal" href="#performance">Performance</a></li>
+<li><a class="reference internal" href="#backward-compatibility">Backward Compatibility</a></li>
+<li><a class="reference internal" href="#alternate-python-implementations">Alternate Python Implementations</a></li>
+<li><a class="reference internal" href="#security-implications">Security Implications</a></li>
+<li><a class="reference internal" href="#maintainability">Maintainability</a></li>
+<li><a class="reference internal" href="#non-obvious-consequences">Non-Obvious Consequences</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#specification">Specification</a><ul>
+<li><a class="reference internal" href="#affected-api">Affected API</a></li>
+<li><a class="reference internal" href="#immortal-global-objects">Immortal Global Objects</a></li>
+<li><a class="reference internal" href="#object-cleanup">Object Cleanup</a></li>
+<li><a class="reference internal" href="#documentation">Documentation</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#rejected-ideas">Rejected Ideas</a><ul>
+<li><a class="reference internal" href="#equate-immortal-with-immutable">Equate Immortal with Immutable</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#reference-implementation">Reference Implementation</a></li>
+<li><a class="reference internal" href="#open-issues">Open Issues</a></li>
+<li><a class="reference internal" href="#references">References</a></li>
+<li><a class="reference internal" href="#copyright">Copyright</a></li>
+</ul>
+</section>
+<section id="abstract">
+<h2><a class="toc-backref" href="#abstract">Abstract</a></h2>
+<p>Under this proposal, any object may be marked as immortal.
+“Immortal” means the object will never be cleaned up (at least until
+runtime finalization).  Specifically, the <a class="reference external" href="https://docs.python.org/3.11/c-api/intro.html#reference-counts">refcount</a> for an immortal
+object is set to a sentinel value, and that refcount is never changed
+by <code class="docutils literal notranslate"><span class="pre">Py_INCREF()</span></code>, <code class="docutils literal notranslate"><span class="pre">Py_DECREF()</span></code>, or <code class="docutils literal notranslate"><span class="pre">Py_SET_REFCNT()</span></code>.
+For immortal containers, the <code class="docutils literal notranslate"><span class="pre">PyGC_Head</span></code> is never
+changed by the garbage collector.</p>
+<p>Avoiding changes to the refcount is an essential part of this
+proposal.  For what we call “immutable” objects, it makes them
+truly immutable.  As described further below, this allows us
+to avoid performance penalties in scenarios that
+would otherwise be prohibitive.</p>
+<p>This proposal is CPython-specific and, effectively, describes
+internal implementation details.</p>
+</section>
+<section id="motivation">
+<h2><a class="toc-backref" href="#motivation">Motivation</a></h2>
+<p>Without immortal objects, all objects are effectively mutable.  That
+includes “immutable” objects like <code class="docutils literal notranslate"><span class="pre">None</span></code> and <code class="docutils literal notranslate"><span class="pre">str</span></code> instances.
+This is because every object’s refcount is frequently modified
+as it is used during execution.  In addition, for containers
+the runtime may modify the object’s <code class="docutils literal notranslate"><span class="pre">PyGC_Head</span></code>.  These
+runtime-internal state currently prevent
+full immutability.</p>
+<p>This has a concrete impact on active projects in the Python community.
+Below we describe several ways in which refcount modification has
+a real negative effect on those projects.  None of that would
+happen for objects that are truly immutable.</p>
+<section id="reducing-cache-invalidation">
+<h3><a class="toc-backref" href="#reducing-cache-invalidation">Reducing Cache Invalidation</a></h3>
+<p>Every modification of a refcount causes the corresponding cache
+line to be invalidated.  This has a number of effects.</p>
+<p>For one, the write must be propagated to other cache levels
+and to main memory.  This has small effect on all Python programs.
+Immortal objects would provide a slight relief in that regard.</p>
+<p>On top of that, multi-core applications pay a price.  If two threads
+are interacting with the same object (e.g. <code class="docutils literal notranslate"><span class="pre">None</span></code>)  then they will
+end up invalidating each other’s caches with each incref and decref.
+This is true even for otherwise immutable objects like <code class="docutils literal notranslate"><span class="pre">True</span></code>,
+<code class="docutils literal notranslate"><span class="pre">0</span></code>, and <code class="docutils literal notranslate"><span class="pre">str</span></code> instances.  This is also true even with
+the GIL, though the impact is smaller.</p>
+</section>
+<section id="avoiding-data-races">
+<h3><a class="toc-backref" href="#avoiding-data-races">Avoiding Data Races</a></h3>
+<p>Speaking of multi-core, we are considering making the GIL
+a per-interpreter lock, which would enable true multi-core parallelism.
+Among other things, the GIL currently protects against races between
+multiple threads that concurrently incref or decref.  Without a shared
+GIL, two running interpreters could not safely share any objects,
+even otherwise immutable ones like <code class="docutils literal notranslate"><span class="pre">None</span></code>.</p>
+<p>This means that, to have a per-interpreter GIL, each interpreter must
+have its own copy of <em>every</em> object, including the singletons and
+static types.  We have a viable strategy for that but it will
+require a meaningful amount of extra effort and extra
+complexity.</p>
+<p>The alternative is to ensure that all shared objects are truly immutable.
+There would be no races because there would be no modification.  This
+is something that the immortality proposed here would enable for
+otherwise immutable objects.  With immortal objects,
+support for a per-interpreter GIL
+becomes much simpler.</p>
+</section>
+<section id="avoiding-copy-on-write">
+<h3><a class="toc-backref" href="#avoiding-copy-on-write">Avoiding Copy-on-Write</a></h3>
+<p>For some applications it makes sense to get the application into
+a desired initial state and then fork the process for each worker.
+This can result in a large performance improvement, especially
+memory usage.  Several enterprise Python users (e.g. Instagram,
+YouTube) have taken advantage of this.  However, the above
+refcount semantics drastically reduce the benefits and
+has led to some sub-optimal workarounds.</p>
+<p>Also note that “fork” isn’t the only operating system mechanism
+that uses copy-on-write semantics.</p>
+</section>
+</section>
+<section id="rationale">
+<h2><a class="toc-backref" href="#rationale">Rationale</a></h2>
+<p>The proposed solution is obvious enough that two people came to the
+same conclusion (and implementation, more or less) independently.
+Other designs were also considered.  Several possibilities
+have also been discussed on python-dev in past years.</p>
+<p>Alternatives include:</p>
+<ul class="simple">
+<li>use a high bit to mark “immortal” but do not change <code class="docutils literal notranslate"><span class="pre">Py_INCREF()</span></code></li>
+<li>add an explicit flag to objects</li>
+<li>implement via the type (<code class="docutils literal notranslate"><span class="pre">tp_dealloc()</span></code> is a no-op)</li>
+<li>track via the object’s type object</li>
+<li>track with a separate table</li>
+</ul>
+<p>Each of the above makes objects immortal, but none of them address
+the performance penalties from refcount modification described above.</p>
+<p>In the case of per-interpreter GIL, the only realistic alternative
+is to move all global objects into <code class="docutils literal notranslate"><span class="pre">PyInterpreterState</span></code> and add
+one or more lookup functions to access them.  Then we’d have to
+add some hacks to the C-API to preserve compatibility for the
+may objects exposed there.  The story is much, much simpler
+with immortal objects</p>
+</section>
+<section id="impact">
+<h2><a class="toc-backref" href="#impact">Impact</a></h2>
+<section id="benefits">
+<h3><a class="toc-backref" href="#benefits">Benefits</a></h3>
+<p>Most notably, the cases described in the two examples above stand
+to benefit greatly from immortal objects.  Projects using pre-fork
+can drop their workarounds.  For the per-interpreter GIL project,
+immortal objects greatly simplifies the solution for existing static
+types, as well as objects exposed by the public C-API.</p>
+<p>In general, a strong immutability guarantee for objects enables Python
+applications to scale like never before.  This is because they can
+then leverage multi-core parallelism without a tradeoff in memory
+usage.  This is reflected in most of the above cases.</p>
+</section>
+<section id="performance">
+<h3><a class="toc-backref" href="#performance">Performance</a></h3>
+<p>A naive implementation shows <a class="reference external" href="https://github.com/python/cpython/pull/19474#issuecomment-1032944709">a 4% slowdown</a>.
+Several promising mitigation strategies will be pursued in the effort
+to bring it closer to performance-neutral.</p>
+<p>On the positive side, immortal objects save a significant amount of
+memory when used with a pre-fork model.  Also, immortal objects provide
+opportunities for specialization in the eval loop that would improve
+performance.</p>
+</section>
+<section id="backward-compatibility">
+<h3><a class="toc-backref" href="#backward-compatibility">Backward Compatibility</a></h3>
+<p>This proposal is completely compatible.  It is internal-only so no API
+is changing.</p>
+<p>The approach is also compatible with extensions compiled to the stable
+ABI.  Unfortunately, they will modify the refcount and invalidate all
+the performance benefits of immortal objects.  However, the high bit
+of the refcount will still match <code class="docutils literal notranslate"><span class="pre">_Py_IMMORTAL_REFCNT</span></code> so we can
+still identify such objects as immortal.</p>
+<p>No user-facing behavior changes, with the following exceptions:</p>
+<ul class="simple">
+<li>code that inspects the refcount (e.g. <code class="docutils literal notranslate"><span class="pre">sys.getrefcount()</span></code>
+or directly via <code class="docutils literal notranslate"><span class="pre">ob_refcnt</span></code>) will see a really, really large
+value</li>
+<li><code class="docutils literal notranslate"><span class="pre">Py_SET_REFCNT()</span></code> will be a no-op for immortal objects</li>
+</ul>
+<p>Neither should cause a problem.</p>
+</section>
+<section id="alternate-python-implementations">
+<h3><a class="toc-backref" href="#alternate-python-implementations">Alternate Python Implementations</a></h3>
+<p>This proposal is CPython-specific.</p>
+</section>
+<section id="security-implications">
+<h3><a class="toc-backref" href="#security-implications">Security Implications</a></h3>
+<p>This feature has no known impact on security.</p>
+</section>
+<section id="maintainability">
+<h3><a class="toc-backref" href="#maintainability">Maintainability</a></h3>
+<p>This is not a complex feature so it should not cause much mental
+overhead for maintainers.  The basic implementation doesn’t touch
+much code so it should have much impact on maintainability.  There
+may be some extra complexity due to performance penalty mitigation.
+However, that should be limited to where we immortalize all
+objects post-init and that code will be in one place.</p>
+</section>
+<section id="non-obvious-consequences">
+<h3><a class="toc-backref" href="#non-obvious-consequences">Non-Obvious Consequences</a></h3>
+<ul class="simple">
+<li>immortal containers effectively immortalize each contained item</li>
+<li>the same is true for objects held internally by other objects
+(e.g. <code class="docutils literal notranslate"><span class="pre">PyTypeObject.tp_subclasses</span></code>)</li>
+<li>an immortal object’s type is effectively immortal</li>
+<li>though extremely unlikely (and technically hard), any object could
+be incref’ed enough to reach <code class="docutils literal notranslate"><span class="pre">_Py_IMMORTAL_REFCNT</span></code> and then
+be treated as immortal</li>
+</ul>
+</section>
+</section>
+<section id="specification">
+<h2><a class="toc-backref" href="#specification">Specification</a></h2>
+<p>The approach involves these fundamental changes:</p>
+<ul class="simple">
+<li>add <code class="docutils literal notranslate"><span class="pre">_Py_IMMORTAL_REFCNT</span></code> (the magic value) to the internal C-API</li>
+<li>update <code class="docutils literal notranslate"><span class="pre">Py_INCREF()</span></code> and <code class="docutils literal notranslate"><span class="pre">Py_DECREF()</span></code> to no-op for objects with
+the magic refcount (or its most significant bit)</li>
+<li>do the same for any other API that modifies the refcount</li>
+<li>stop modifying <code class="docutils literal notranslate"><span class="pre">PyGC_Head</span></code> for immortal containers</li>
+<li>ensure that all immortal objects are cleaned up during
+runtime finalization</li>
+</ul>
+<p>Then setting any object’s refcount to <code class="docutils literal notranslate"><span class="pre">_Py_IMMORTAL_REFCNT</span></code>
+makes it immortal.</p>
+<p>To be clear, we will likely use the most-significant bit of
+<code class="docutils literal notranslate"><span class="pre">_Py_IMMORTAL_REFCNT</span></code> to tell if an object is immortal, rather
+than comparing with <code class="docutils literal notranslate"><span class="pre">_Py_IMMORTAL_REFCNT</span></code> directly.</p>
+<p>(There are other minor, internal changes which are not described here.)</p>
+<p>This is not meant to be a public feature but rather an internal one.
+So the proposal does <em>not</em> including adding any new public C-API,
+nor any Python API.  However, this does not prevent us from
+adding (publicly accessible) private API to do things
+like immortalize an object or tell if one
+is immortal.</p>
+<section id="affected-api">
+<h3><a class="toc-backref" href="#affected-api">Affected API</a></h3>
+<p>API that will now ignore immortal objects:</p>
+<ul class="simple">
+<li>(public) <code class="docutils literal notranslate"><span class="pre">Py_INCREF()</span></code></li>
+<li>(public) <code class="docutils literal notranslate"><span class="pre">Py_DECREF()</span></code></li>
+<li>(public) <code class="docutils literal notranslate"><span class="pre">Py_SET_REFCNT()</span></code></li>
+<li>(private) <code class="docutils literal notranslate"><span class="pre">_Py_NewReference()</span></code></li>
+</ul>
+<p>API that exposes refcounts (unchanged but may now return large values):</p>
+<ul class="simple">
+<li>(public) <code class="docutils literal notranslate"><span class="pre">Py_REFCNT()</span></code></li>
+<li>(public) <code class="docutils literal notranslate"><span class="pre">sys.getrefcount()</span></code></li>
+</ul>
+<p>(Note that <code class="docutils literal notranslate"><span class="pre">_Py_RefTotal</span></code> and <code class="docutils literal notranslate"><span class="pre">sys.gettotalrefcount()</span></code>
+will not be affected.)</p>
+</section>
+<section id="immortal-global-objects">
+<h3><a class="toc-backref" href="#immortal-global-objects">Immortal Global Objects</a></h3>
+<p>The following objects will be made immortal:</p>
+<ul class="simple">
+<li>singletons (<code class="docutils literal notranslate"><span class="pre">None</span></code>, <code class="docutils literal notranslate"><span class="pre">True</span></code>, <code class="docutils literal notranslate"><span class="pre">False</span></code>, <code class="docutils literal notranslate"><span class="pre">Ellipsis</span></code>, <code class="docutils literal notranslate"><span class="pre">NotImplemented</span></code>)</li>
+<li>all static types (e.g. <code class="docutils literal notranslate"><span class="pre">PyLong_Type</span></code>, <code class="docutils literal notranslate"><span class="pre">PyExc_Exception</span></code>)</li>
+<li>all static objects in <code class="docutils literal notranslate"><span class="pre">_PyRuntimeState.global_objects</span></code> (e.g. identifiers,
+small ints)</li>
+</ul>
+<p>There will likely be others we have not enumerated here.</p>
+</section>
+<section id="object-cleanup">
+<h3><a class="toc-backref" href="#object-cleanup">Object Cleanup</a></h3>
+<p>In order to clean up all immortal objects during runtime finalization,
+we must keep track of them.</p>
+<p>For container objects we’ll leverage the GC’s permanent generation by
+pushing all immortalized containers there.  During runtime shutdown, the
+strategy will be to first let the runtime try to do its best effort of
+deallocating these instances normally.  Most of the module deallocation
+will now be handled by pylifecycle.c:finalize_modules which cleans up
+the remaining modules as best as we can.  It will change which modules
+are available during __del__ but that’s already defined as undefined
+behavior by the docs.  Optionally, we could do some topological disorder
+to guarantee that user modules will be deallocated first before the
+stdlib modules.  Finally, anything leftover (if any) can be found
+through the permanent generation gc list which we can clear after
+finalize_modules.</p>
+<p>For non-container objects, the tracking approach will vary on a
+case-by-case basis.  In nearly every case, each such object is directly
+accessible on the runtime state, e.g. in a <code class="docutils literal notranslate"><span class="pre">_PyRuntimeState</span></code> or
+<code class="docutils literal notranslate"><span class="pre">PyInterpreterState</span></code> field.  We may need to add a tracking mechanism
+to the runtime state for a small number of objects.</p>
+</section>
+<section id="documentation">
+<h3><a class="toc-backref" href="#documentation">Documentation</a></h3>
+<p>The feature itself is internal and will not be added to the documentation.</p>
+<p>We <em>may</em> add a note about immortal objects to the following,
+to help reduce any surprise users may have with the change:</p>
+<ul class="simple">
+<li><code class="docutils literal notranslate"><span class="pre">Py_SET_REFCNT()</span></code> (a no-op for immortal objects)</li>
+<li><code class="docutils literal notranslate"><span class="pre">Py_REFCNT()</span></code> (value may be surprisingly large)</li>
+<li><code class="docutils literal notranslate"><span class="pre">sys.getrefcount()</span></code> (value may be surprisingly large)</li>
+</ul>
+<p>Other API that might benefit from such notes are currently undocumented.</p>
+<p>We wouldn’t add a note anywhere else (including for <code class="docutils literal notranslate"><span class="pre">Py_INCREF()</span></code> and
+<code class="docutils literal notranslate"><span class="pre">Py_DECREF()</span></code>) since the feature is otherwise transparent to users.</p>
+</section>
+</section>
+<section id="rejected-ideas">
+<h2><a class="toc-backref" href="#rejected-ideas">Rejected Ideas</a></h2>
+<section id="equate-immortal-with-immutable">
+<h3><a class="toc-backref" href="#equate-immortal-with-immutable">Equate Immortal with Immutable</a></h3>
+<p>Making a mutable object immortal isn’t particularly helpful.
+The exception is if you can ensure the object isn’t actually
+modified again.  Since we aren’t enforcing any immutability
+for immortal objects it didn’t make sense to emphasis
+that relationship.</p>
+</section>
+</section>
+<section id="reference-implementation">
+<h2><a class="toc-backref" href="#reference-implementation">Reference Implementation</a></h2>
+<p>The implementation is proposed on GitHub:</p>
+<p><a class="reference external" href="https://github.com/python/cpython/pull/19474">https://github.com/python/cpython/pull/19474</a></p>
+</section>
+<section id="open-issues">
+<h2><a class="toc-backref" href="#open-issues">Open Issues</a></h2>
+<ul class="simple">
+<li>is there any other impact on GC?</li>
+</ul>
+</section>
+<section id="references">
+<h2><a class="toc-backref" href="#references">References</a></h2>
+<p>This was discussed in December 2021 on python-dev:</p>
+<ul class="simple">
+<li><a class="reference external" href="https://mail.python.org/archives/list/python-dev&#64;python.org/thread/7O3FUA52QGTVDC6MDAV5WXKNFEDRK5D6/#TBTHSOI2XRWRO6WQOLUW3X7S5DUXFAOV">https://mail.python.org/archives/list/python-dev&#64;python.org/thread/7O3FUA52QGTVDC6MDAV5WXKNFEDRK5D6/#TBTHSOI2XRWRO6WQOLUW3X7S5DUXFAOV</a></li>
+<li><a class="reference external" href="https://mail.python.org/archives/list/python-dev&#64;python.org/thread/PNLBJBNIQDMG2YYGPBCTGOKOAVXRBJWY">https://mail.python.org/archives/list/python-dev&#64;python.org/thread/PNLBJBNIQDMG2YYGPBCTGOKOAVXRBJWY</a></li>
+</ul>
+</section>
+<section id="copyright">
+<h2><a class="toc-backref" href="#copyright">Copyright</a></h2>
+<p>This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.</p>
+</section>
+</section>
+<hr class="docutils" />
+<p>Source: <a class="reference external" href="https://github.com/python/peps/blob/main/pep-0683.rst">https://github.com/python/peps/blob/main/pep-0683.rst</a></p>
+<p>Last modified: <a class="reference external" href="https://github.com/python/peps/commits/main/pep-0683.rst">2022-02-16 00:29:37 GMT</a></p>
+
+        </article>
+        <nav id="pep-sidebar">
+            <h2>Contents</h2>
+            <p id="toc-title">PEP 683 – Immortal Objects, Using a Fixed Refcount</p>
+            <ul>
+<li><a class="reference internal" href="#contents">Contents</a></li>
+<li><a class="reference internal" href="#abstract">Abstract</a></li>
+<li><a class="reference internal" href="#motivation">Motivation</a><ul>
+<li><a class="reference internal" href="#reducing-cache-invalidation">Reducing Cache Invalidation</a></li>
+<li><a class="reference internal" href="#avoiding-data-races">Avoiding Data Races</a></li>
+<li><a class="reference internal" href="#avoiding-copy-on-write">Avoiding Copy-on-Write</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#rationale">Rationale</a></li>
+<li><a class="reference internal" href="#impact">Impact</a><ul>
+<li><a class="reference internal" href="#benefits">Benefits</a></li>
+<li><a class="reference internal" href="#performance">Performance</a></li>
+<li><a class="reference internal" href="#backward-compatibility">Backward Compatibility</a></li>
+<li><a class="reference internal" href="#alternate-python-implementations">Alternate Python Implementations</a></li>
+<li><a class="reference internal" href="#security-implications">Security Implications</a></li>
+<li><a class="reference internal" href="#maintainability">Maintainability</a></li>
+<li><a class="reference internal" href="#non-obvious-consequences">Non-Obvious Consequences</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#specification">Specification</a><ul>
+<li><a class="reference internal" href="#affected-api">Affected API</a></li>
+<li><a class="reference internal" href="#immortal-global-objects">Immortal Global Objects</a></li>
+<li><a class="reference internal" href="#object-cleanup">Object Cleanup</a></li>
+<li><a class="reference internal" href="#documentation">Documentation</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#rejected-ideas">Rejected Ideas</a><ul>
+<li><a class="reference internal" href="#equate-immortal-with-immutable">Equate Immortal with Immutable</a></li>
+</ul>
+</li>
+<li><a class="reference internal" href="#reference-implementation">Reference Implementation</a></li>
+<li><a class="reference internal" href="#open-issues">Open Issues</a></li>
+<li><a class="reference internal" href="#references">References</a></li>
+<li><a class="reference internal" href="#copyright">Copyright</a></li>
+</ul>
+
+            <br />
+            <a id="source" href="https://github.com/python/peps/blob/main/pep-0683.rst">Page Source (GitHub)</a>
+        </nav>
+    </section>
+    <script src="../_static/colour_scheme.js"></script>
+</body>
+</html>
